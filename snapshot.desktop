@@ -1,0 +1,9 @@
+[Desktop Entry]
+Name=SnapShot
+Comment=Quick area screenshot tool
+Exec=python3 /home/michell-clay/SnapShot/snapshot.py
+Icon=applets-screenshooter
+Terminal=false
+Type=Application
+Categories=Utility;Graphics;
+Keywords=screenshot;capture;snip;
