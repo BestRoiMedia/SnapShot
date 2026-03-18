@@ -1,18 +1,29 @@
 #!/usr/bin/env python3
 """SnapShot - Simple area screenshot tool for Ubuntu.
+Lives in the top panel as an indicator. Click to screenshot, right-click for settings.
 No cairo bridge (python3-gi-cairo) needed — uses pixbuf compositing."""
 
 import gi
 gi.require_version("Gtk", "3.0")
 gi.require_version("Gdk", "3.0")
 
+# Support both Ayatana (modern Ubuntu) and legacy AppIndicator3
+try:
+    gi.require_version("AyatanaAppIndicator3", "0.1")
+    from gi.repository import AyatanaAppIndicator3 as AppIndicator3
+except (ValueError, ImportError):
+    gi.require_version("AppIndicator3", "0.1")
+    from gi.repository import AppIndicator3
+
 import json
 import os
+import shutil
 import subprocess
+import tempfile
 from datetime import datetime
 from pathlib import Path
 
-from PIL import Image, ImageEnhance
+from PIL import Image, ImageChops, ImageEnhance
 from gi.repository import Gdk, GdkPixbuf, Gtk, GLib
 
 CONFIG_DIR = Path.home() / ".config" / "snapshot"
@@ -53,14 +64,52 @@ def darken_pixbuf(pixbuf, factor=0.55):
     return pb
 
 
+def _pixbuf_to_pil(pixbuf):
+    """Convert a GdkPixbuf to a PIL Image."""
+    w = pixbuf.get_width()
+    h = pixbuf.get_height()
+    nc = pixbuf.get_n_channels()
+    rs = pixbuf.get_rowstride()
+    pixels = pixbuf.get_pixels()
+    mode = "RGBA" if nc == 4 else "RGB"
+    return Image.frombuffer(mode, (w, h), pixels, "raw", mode, rs, 1)
+
+
+def _show_error(message):
+    """Show a GTK error dialog."""
+    dialog = Gtk.MessageDialog(
+        parent=None,
+        flags=0,
+        message_type=Gtk.MessageType.ERROR,
+        buttons=Gtk.ButtonsType.OK,
+        text=message,
+    )
+    dialog.run()
+    dialog.destroy()
+
+
+def _mean_diff(img1, img2):
+    """Mean per-pixel difference between two same-sized images (0-255 scale)."""
+    diff = ImageChops.difference(img1.convert("L"), img2.convert("L"))
+    hist = diff.histogram()
+    total = sum(i * count for i, count in enumerate(hist))
+    return total / (img1.size[0] * img1.size[1])
+
+
+def _images_similar(img1, img2, threshold=3):
+    """Check if two same-sized images are nearly identical."""
+    return _mean_diff(img1, img2) < threshold
+
+
 class AreaSelector(Gtk.Window):
     """Fullscreen overlay for drag-selecting a screen region.
     Uses Gtk.Image layers to avoid needing python3-gi-cairo."""
 
-    def __init__(self, callback, screenshot):
+    def __init__(self, callback, screenshot, mode="pixbuf"):
         super().__init__(title="Select Area")
         self.callback = callback
         self.screenshot = screenshot
+        self.mode = mode  # "pixbuf" returns cropped pixbuf, "coords" returns (x, y, w, h)
         self.start_x = 0
         self.start_y = 0
         self.end_x = 0
@@ -211,9 +260,12 @@ class AreaSelector(Gtk.Window):
                 y = max(0, min(y, pb_h - 1))
                 w = min(w, pb_w - x)
                 h = min(h, pb_h - y)
-                pixbuf = self.screenshot.new_subpixbuf(x, y, w, h)
                 self.hide()
-                self.callback(pixbuf)
+                if self.mode == "coords":
+                    self.callback((x, y, w, h))
+                else:
+                    pixbuf = self.screenshot.new_subpixbuf(x, y, w, h)
+                    self.callback(pixbuf)
                 self.destroy()
             else:
                 self.hide()
@@ -233,57 +285,140 @@ class AreaSelector(Gtk.Window):
             self.destroy()
 
 
-class SnapShotApp(Gtk.Window):
-    """Main application window."""
+class RecordingControls(Gtk.Window):
+    """Floating 'REC 0:00 [Stop]' control bar shown during GIF recording."""
+
+    def __init__(self, stop_callback, label_prefix="REC"):
+        super().__init__(title="Recording")
+        self.stop_callback = stop_callback
+        self.label_prefix = label_prefix
+        self.elapsed = 0
+
+        self.set_decorated(False)
+        self.set_keep_above(True)
+        self.set_skip_taskbar_hint(True)
+        self.set_default_size(180, 40)
+        self.set_resizable(False)
+
+        # Position at top-center of screen
+        screen = Gdk.Screen.get_default()
+        self.move(screen.get_width() // 2 - 90, 10)
+
+        css = Gtk.CssProvider()
+        css.load_from_data(b"""
+            .rec-bar {
+                background: #cc0000;
+                border-radius: 8px;
+                padding: 4px 12px;
+            }
+            .rec-label {
+                color: white;
+                font-weight: bold;
+                font-size: 14px;
+            }
+            .rec-stop {
+                background: white;
+                color: #cc0000;
+                font-weight: bold;
+                border-radius: 4px;
+                padding: 2px 12px;
+                border: none;
+            }
+        """)
+        Gtk.StyleContext.add_provider_for_screen(
+            screen, css, Gtk.STYLE_PROVIDER_PRIORITY_APPLICATION
+        )
+
+        hbox = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=10)
+        hbox.get_style_context().add_class("rec-bar")
+
+        self.label = Gtk.Label(label=f"{self.label_prefix}  0:00")
+        self.label.get_style_context().add_class("rec-label")
+        hbox.pack_start(self.label, True, True, 0)
+
+        stop_btn = Gtk.Button(label="Stop")
+        stop_btn.get_style_context().add_class("rec-stop")
+        stop_btn.connect("clicked", self._on_stop)
+        hbox.pack_end(stop_btn, False, False, 0)
+
+        self.add(hbox)
+        self._timer_id = GLib.timeout_add(1000, self._tick)
+
+    def _tick(self):
+        self.elapsed += 1
+        mins = self.elapsed // 60
+        secs = self.elapsed % 60
+        self.label.set_text(f"{self.label_prefix}  {mins}:{secs:02d}")
+        return True
+
+    def _on_stop(self, widget):
+        if self._timer_id:
+            GLib.source_remove(self._timer_id)
+            self._timer_id = None
+        self.hide()
+        self.stop_callback()
+        self.destroy()
+
+
+class SnapShotIndicator:
+    """System tray indicator — left-click to screenshot, right-click for menu."""
 
     def __init__(self):
-        super().__init__(title="SnapShot")
         self.config = load_config()
-        self.set_default_size(320, 180)
-        self.set_resizable(False)
-        self.set_position(Gtk.WindowPosition.CENTER)
-
         Path(self.config["save_dir"]).mkdir(parents=True, exist_ok=True)
 
-        header = Gtk.HeaderBar()
-        header.set_show_close_button(True)
-        header.set_title("SnapShot")
-        header.set_subtitle(self._short_path(self.config["save_dir"]))
-        self.header = header
-        self.set_titlebar(header)
+        # Create the indicator in the top panel
+        self.indicator = AppIndicator3.Indicator.new(
+            "snapshot-indicator",
+            "applets-screenshooter",
+            AppIndicator3.IndicatorCategory.APPLICATION_STATUS,
+        )
+        self.indicator.set_status(AppIndicator3.IndicatorStatus.ACTIVE)
+        self.indicator.set_title("SnapShot")
 
-        vbox = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=16)
-        vbox.set_margin_top(24)
-        vbox.set_margin_bottom(24)
-        vbox.set_margin_start(24)
-        vbox.set_margin_end(24)
+        # Build the right-click menu
+        self.menu = Gtk.Menu()
 
-        btn_screenshot = Gtk.Button(label="Take Screenshot")
-        btn_screenshot.get_style_context().add_class("suggested-action")
-        btn_screenshot.set_size_request(-1, 48)
-        btn_screenshot.connect("clicked", self.on_take_screenshot)
-        vbox.pack_start(btn_screenshot, False, False, 0)
+        item_screenshot = Gtk.MenuItem(label="Take Screenshot")
+        item_screenshot.connect("activate", self.on_take_screenshot)
+        self.menu.append(item_screenshot)
 
-        folder_box = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=8)
-        folder_label = Gtk.Label(label="Save to:")
-        folder_label.set_xalign(0)
-        self.folder_display = Gtk.Label(label=self._short_path(self.config["save_dir"]))
-        self.folder_display.set_xalign(0)
-        self.folder_display.set_ellipsize(3)
-        btn_folder = Gtk.Button(label="Change")
-        btn_folder.connect("clicked", self.on_change_folder)
+        item_scrolling = Gtk.MenuItem(label="Scrolling Capture")
+        item_scrolling.connect("activate", self.on_scrolling_capture)
+        self.menu.append(item_scrolling)
 
-        folder_box.pack_start(folder_label, False, False, 0)
-        folder_box.pack_start(self.folder_display, True, True, 0)
-        folder_box.pack_end(btn_folder, False, False, 0)
-        vbox.pack_start(folder_box, False, False, 0)
+        item_gif = Gtk.MenuItem(label="Record GIF")
+        item_gif.connect("activate", self.on_record_gif)
+        self.menu.append(item_gif)
 
-        btn_open = Gtk.Button(label="Open Screenshots Folder")
-        btn_open.connect("clicked", self.on_open_folder)
-        vbox.pack_start(btn_open, False, False, 0)
+        self.menu.append(Gtk.SeparatorMenuItem())
 
-        self.add(vbox)
-        self.connect("destroy", Gtk.main_quit)
+        self.folder_item = Gtk.MenuItem(
+            label=f"Save to: {self._short_path(self.config['save_dir'])}"
+        )
+        self.folder_item.set_sensitive(False)
+        self.menu.append(self.folder_item)
+
+        item_change_folder = Gtk.MenuItem(label="Change Save Folder...")
+        item_change_folder.connect("activate", self.on_change_folder)
+        self.menu.append(item_change_folder)
+
+        item_open_folder = Gtk.MenuItem(label="Open Screenshots Folder")
+        item_open_folder.connect("activate", self.on_open_folder)
+        self.menu.append(item_open_folder)
+
+        self.menu.append(Gtk.SeparatorMenuItem())
+
+        item_quit = Gtk.MenuItem(label="Quit")
+        item_quit.connect("activate", self.on_quit)
+        self.menu.append(item_quit)
+
+        self.menu.show_all()
+        self.indicator.set_menu(self.menu)
+
+        # Left-click: use the secondary activate signal to take a screenshot
+        self.indicator.connect("scroll-event", lambda *a: None)
+        self.indicator.set_secondary_activate_target(item_screenshot)
 
     def _short_path(self, path):
         home = str(Path.home())
@@ -291,9 +426,8 @@ class SnapShotApp(Gtk.Window):
             return "~" + path[len(home):]
         return path
 
-    def on_take_screenshot(self, button):
-        self.hide()
-        # Let the window fully disappear, then capture
+    def on_take_screenshot(self, widget):
+        # Small delay to let any menu close before capturing
         GLib.timeout_add(350, self._start_selection)
 
     def _start_selection(self):
@@ -307,7 +441,6 @@ class SnapShotApp(Gtk.Window):
 
     def _on_screenshot_done(self, pixbuf):
         if pixbuf is None:
-            self.show_all()
             return
 
         timestamp = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
@@ -318,7 +451,6 @@ class SnapShotApp(Gtk.Window):
         pixbuf.savev(filepath, "png", [], [])
 
         self._notify(f"Saved: {filename}", filepath)
-        self.show_all()
 
     def _notify(self, message, filepath):
         try:
@@ -329,20 +461,324 @@ class SnapShotApp(Gtk.Window):
         except FileNotFoundError:
             pass
 
-        dialog = Gtk.MessageDialog(
-            transient_for=self,
-            message_type=Gtk.MessageType.INFO,
-            buttons=Gtk.ButtonsType.OK,
-            text="Screenshot Saved",
-        )
-        dialog.format_secondary_text(filepath)
-        dialog.run()
-        dialog.destroy()
+    # --- Scrolling Capture ---
 
-    def on_change_folder(self, button):
+    def on_scrolling_capture(self, widget):
+        GLib.timeout_add(350, self._start_scrolling_selection)
+
+    def _start_scrolling_selection(self):
+        root = Gdk.get_default_root_window()
+        w = root.get_width()
+        h = root.get_height()
+        screenshot = Gdk.pixbuf_get_from_window(root, 0, 0, w, h)
+        selector = AreaSelector(self._on_scrolling_area_selected, screenshot,
+                                mode="coords")
+        selector.show_all()
+        return False
+
+    def _on_scrolling_area_selected(self, coords):
+        if coords is None:
+            return
+        self._scroll_coords = coords
+        self._scroll_frames = []
+        self._scroll_prev_frame = None
+        # Small delay to let the overlay disappear
+        GLib.timeout_add(300, self._start_scrolling_recording)
+
+    def _start_scrolling_recording(self):
+        # Capture the initial frame
+        self._capture_scroll_frame()
+        # Start periodic capture every 300ms
+        self._scroll_timer_id = GLib.timeout_add(300, self._capture_scroll_frame)
+        # Show control bar
+        self._scroll_controls = RecordingControls(
+            self._stop_scrolling_capture, label_prefix="SCROLL"
+        )
+        self._scroll_controls.show_all()
+        return False
+
+    def _capture_scroll_frame(self):
+        x, y, w, h = self._scroll_coords
+        root = Gdk.get_default_root_window()
+        pixbuf = Gdk.pixbuf_get_from_window(root, x, y, w, h)
+        if pixbuf is None:
+            return True
+
+        frame = _pixbuf_to_pil(pixbuf)
+
+        # Skip if nearly identical to the last captured frame (no scrolling)
+        if self._scroll_prev_frame is not None:
+            if _images_similar(frame, self._scroll_prev_frame):
+                return True
+
+        self._scroll_prev_frame = frame.copy()
+        self._scroll_frames.append(frame)
+        return True
+
+    def _stop_scrolling_capture(self):
+        if hasattr(self, "_scroll_timer_id") and self._scroll_timer_id:
+            GLib.source_remove(self._scroll_timer_id)
+            self._scroll_timer_id = None
+        GLib.idle_add(self._stitch_scroll_frames)
+
+    def _find_scroll_amount(self, prev, curr):
+        """Find how many pixels were scrolled between two frames.
+
+        When the page scrolls down by d pixels, content at position y in prev
+        appears at position y-d in curr.
+
+        Uses the entire bottom half of prev as a reference (downsampled 4x
+        for speed).  A large reference region is far more robust against
+        repeating page layouts (card grids, etc.) than a thin band.
+
+        Validates the best match with a second reference from the top half.
+
+        Returns d (> 0) on success, -1 if no reliable match.
+        """
+        h = prev.height
+        w = prev.width
+        if h < 16 or w < 16:
+            return -1
+
+        scale = 4
+        sw, sh = w // scale, h // scale
+        if sw < 4 or sh < 4:
+            return -1
+
+        sp = prev.convert("L").resize((sw, sh), Image.NEAREST)
+        sc = curr.convert("L").resize((sw, sh), Image.NEAREST)
+
+        # --- Primary: bottom-half reference ---
+        ref_top = sh // 2
+        ref = sp.crop((0, ref_top, sw, sh))
+        ref_h = sh - ref_top
+
+        best_d = 0
+        best_diff = 999.0
+        for ds in range(1, ref_top + 1):
+            sy = ref_top - ds
+            if sy + ref_h > sh:
+                continue
+            test = sc.crop((0, sy, sw, sy + ref_h))
+            diff = _mean_diff(ref, test)
+            if diff < best_diff:
+                best_diff = diff
+                best_d = ds
+            if diff < 0.8:
+                break
+
+        if best_diff > 6:
+            return -1
+
+        # --- Validate: top-quarter reference ---
+        # A band from 15-25% of prev should shift by the same amount.
+        val_y = int(sh * 0.15)
+        val_h = int(sh * 0.10) or 1
+        if val_y + val_h <= sh and val_y - best_d >= 0:
+            val_ref = sp.crop((0, val_y, sw, val_y + val_h))
+            val_test = sc.crop((0, val_y - best_d, sw, val_y - best_d + val_h))
+            vdiff = _mean_diff(val_ref, val_test)
+            if vdiff > 12:
+                return -1
+
+        # --- Refine at full resolution ---
+        # The coarse result is accurate to ±scale pixels.  Try multiple
+        # reference bands (at 35%, 50%, 65% height) and pick the offset
+        # that gets the best overall agreement.
+        coarse_d = best_d * scale
+        band_h = min(24, h // 6)
+        prev_l = prev.convert("L")
+        curr_l = curr.convert("L")
+        search_lo = max(1, coarse_d - scale - 1)
+        search_hi = min(coarse_d + scale + 2, h)
+
+        # Accumulate diff scores for each candidate offset
+        scores = {}
+        for d in range(search_lo, search_hi):
+            scores[d] = 0.0
+
+        for ref_pct in (0.35, 0.50, 0.65):
+            ref_y = int(h * ref_pct)
+            if ref_y + band_h > h:
+                continue
+            ref_band = prev_l.crop((0, ref_y, w, ref_y + band_h))
+            for d in range(search_lo, search_hi):
+                sy = ref_y - d
+                if sy < 0 or sy + band_h > h:
+                    scores[d] += 50.0  # penalty for out-of-bounds
+                    continue
+                test = curr_l.crop((0, sy, w, sy + band_h))
+                scores[d] += _mean_diff(ref_band, test)
+
+        fine_d = min(scores, key=scores.get)
+
+        # Add 1px overlap bias — a tiny overlap is invisible, but a 1px
+        # gap or duplicated row creates a visible seam.
+        if fine_d + 1 in scores and scores[fine_d + 1] - scores[fine_d] < 0.5:
+            fine_d += 1
+
+        return fine_d
+
+    def _stitch_scroll_frames(self):
+        frames = self._scroll_frames
+        if not frames:
+            return False
+
+        x, y, w, h = self._scroll_coords
+
+        strips = [frames[0]]
+        last_matched = frames[0]  # last frame we successfully matched
+
+        for i in range(1, len(frames)):
+            curr = frames[i]
+
+            # Skip nearly identical frames
+            if _images_similar(last_matched, curr, threshold=2):
+                continue
+
+            scroll_d = self._find_scroll_amount(last_matched, curr)
+
+            if scroll_d > 0:
+                # Append only the newly revealed content at the bottom
+                new_part = curr.crop((0, curr.height - scroll_d,
+                                      curr.width, curr.height))
+                if new_part.height > 0:
+                    strips.append(new_part)
+                last_matched = curr
+            # scroll_d == -1: no reliable match — skip this frame.
+            # Keep last_matched unchanged so the next frame compares
+            # against the last good reference.
+
+        # Stitch all strips vertically
+        total_height = sum(s.height for s in strips)
+        result = Image.new(strips[0].mode, (w, total_height))
+        y_offset = 0
+        for s in strips:
+            result.paste(s, (0, y_offset))
+            y_offset += s.height
+
+        # Save
+        timestamp = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
+        filename = f"scrolling_{timestamp}.png"
+        filepath = os.path.join(self.config["save_dir"], filename)
+        Path(self.config["save_dir"]).mkdir(parents=True, exist_ok=True)
+        result.save(filepath, "PNG")
+
+        self._notify(f"Saved: {filename}", filepath)
+
+        # Cleanup
+        self._scroll_frames = []
+        self._scroll_prev_frame = None
+        return False
+
+    # --- GIF Recording ---
+
+    def on_record_gif(self, widget):
+        if not shutil.which("ffmpeg"):
+            GLib.idle_add(_show_error,
+                          "GIF Recording requires ffmpeg.\n\n"
+                          "Install it with:\n  sudo apt install ffmpeg")
+            return
+        GLib.timeout_add(350, self._start_gif_selection)
+
+    def _start_gif_selection(self):
+        root = Gdk.get_default_root_window()
+        w = root.get_width()
+        h = root.get_height()
+        screenshot = Gdk.pixbuf_get_from_window(root, 0, 0, w, h)
+        selector = AreaSelector(self._on_gif_area_selected, screenshot,
+                                mode="coords")
+        selector.show_all()
+        return False
+
+    def _on_gif_area_selected(self, coords):
+        if coords is None:
+            return
+        x, y, w, h = coords
+        # Small delay to let the overlay disappear
+        GLib.timeout_add(300, self._start_gif_recording, x, y, w, h)
+
+    def _start_gif_recording(self, x, y, w, h):
+        self._gif_tmpdir = tempfile.mkdtemp(prefix="snapshot_gif_")
+        self._gif_raw = os.path.join(self._gif_tmpdir, "recording.mkv")
+        display = os.environ.get("DISPLAY", ":0")
+
+        # Ensure even dimensions (required by ffmpeg)
+        w = w if w % 2 == 0 else w - 1
+        h = h if h % 2 == 0 else h - 1
+
+        self._ffmpeg_proc = subprocess.Popen(
+            [
+                "ffmpeg", "-y",
+                "-f", "x11grab",
+                "-framerate", "15",
+                "-video_size", f"{w}x{h}",
+                "-i", f"{display}+{x},{y}",
+                "-c:v", "libx264", "-preset", "ultrafast",
+                "-pix_fmt", "yuv420p",
+                self._gif_raw,
+            ],
+            stdin=subprocess.PIPE,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+        )
+
+        self._rec_controls = RecordingControls(self._stop_gif_recording)
+        self._rec_controls.show_all()
+        return False
+
+    def _stop_gif_recording(self):
+        if hasattr(self, "_ffmpeg_proc") and self._ffmpeg_proc.poll() is None:
+            # Send 'q' to ffmpeg to stop gracefully
+            try:
+                self._ffmpeg_proc.stdin.write(b"q")
+                self._ffmpeg_proc.stdin.flush()
+            except (BrokenPipeError, OSError):
+                self._ffmpeg_proc.terminate()
+            self._ffmpeg_proc.wait(timeout=10)
+
+        # Convert to GIF using 2-pass palettegen for quality
+        GLib.idle_add(self._convert_to_gif)
+
+    def _convert_to_gif(self):
+        palette = os.path.join(self._gif_tmpdir, "palette.png")
+        timestamp = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
+        filename = f"recording_{timestamp}.gif"
+        filepath = os.path.join(self.config["save_dir"], filename)
+        Path(self.config["save_dir"]).mkdir(parents=True, exist_ok=True)
+
+        # Pass 1: generate palette
+        subprocess.run(
+            [
+                "ffmpeg", "-y", "-i", self._gif_raw,
+                "-vf", "fps=15,palettegen=stats_mode=diff",
+                palette,
+            ],
+            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+        )
+
+        # Pass 2: create GIF with palette
+        subprocess.run(
+            [
+                "ffmpeg", "-y", "-i", self._gif_raw, "-i", palette,
+                "-lavfi", "fps=15[x];[x][1:v]paletteuse=dither=bayer:bayer_scale=5",
+                filepath,
+            ],
+            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+        )
+
+        # Clean up temp files
+        shutil.rmtree(self._gif_tmpdir, ignore_errors=True)
+
+        if os.path.exists(filepath):
+            self._notify(f"Saved: {filename}", filepath)
+
+        return False
+
+    def on_change_folder(self, widget):
         dialog = Gtk.FileChooserDialog(
             title="Choose Screenshots Folder",
-            parent=self,
+            parent=None,
             action=Gtk.FileChooserAction.SELECT_FOLDER,
         )
         dialog.add_buttons(
@@ -356,21 +792,24 @@ class SnapShotApp(Gtk.Window):
             new_dir = dialog.get_filename()
             self.config["save_dir"] = new_dir
             save_config(self.config)
-            self.folder_display.set_text(self._short_path(new_dir))
-            self.header.set_subtitle(self._short_path(new_dir))
+            self.folder_item.set_label(
+                f"Save to: {self._short_path(new_dir)}"
+            )
 
         dialog.destroy()
 
-    def on_open_folder(self, button):
+    def on_open_folder(self, widget):
         subprocess.Popen(
             ["xdg-open", self.config["save_dir"]],
             stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
         )
 
+    def on_quit(self, widget):
+        Gtk.main_quit()
+
 
 def main():
-    app = SnapShotApp()
-    app.show_all()
+    indicator = SnapShotIndicator()
     Gtk.main()
 
 
